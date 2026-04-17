@@ -201,7 +201,3 @@ src/
 3. Add TaskType enum value
 4. Implement execute method
 5. Add tests in `src/tests/`
-
-## License
-
-MIT
