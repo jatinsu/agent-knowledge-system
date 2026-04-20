@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -36,12 +36,10 @@ class RouterOrchestrator:
         self.gateway = llm_gateway
         self.db = db
 
-        self.github_ingestor = GitHubIngestor(github_token) if github_token else None
-        self.jira_ingestor = (
-            JiraIngestor(jira_url, jira_email, jira_token)
-            if jira_url and jira_email and jira_token
-            else None
-        )
+        self.github_token = github_token
+        self.jira_url = jira_url
+        self.jira_email = jira_email
+        self.jira_token = jira_token
 
         self.feature_builder = FeatureBuilder(db)
         self.graph_builder = GraphBuilder()
@@ -63,29 +61,31 @@ class RouterOrchestrator:
             raise ValueError(f"Unknown task type: {task_type}")
 
     async def _ingest_github(self, params: dict[str, Any]) -> dict[str, Any]:
-        if not self.github_ingestor:
+        if not self.github_token:
             raise ValueError("GitHub ingestor not configured")
 
         owner = params["owner"]
         repo = params["repo"]
         limit = params.get("limit", 100)
 
-        prs = await self.github_ingestor.ingest_pull_requests(owner, repo, self.db, limit)
+        async with GitHubIngestor(self.github_token) as ingestor:
+            prs = await ingestor.ingest_pull_requests(owner, repo, self.db, limit)
 
         return {"status": "success", "pr_count": len(prs)}
 
     async def _ingest_jira(self, params: dict[str, Any]) -> dict[str, Any]:
-        if not self.jira_ingestor:
+        if not all([self.jira_url, self.jira_email, self.jira_token]):
             raise ValueError("Jira ingestor not configured")
 
-        if "jql" in params:
-            tickets = await self.jira_ingestor.ingest_issues_by_jql(
-                params["jql"], self.db, params.get("limit", 100)
-            )
-        elif "keys" in params:
-            tickets = await self.jira_ingestor.ingest_issues_by_keys(params["keys"], self.db)
-        else:
-            raise ValueError("Must provide either 'jql' or 'keys'")
+        async with JiraIngestor(self.jira_url, self.jira_email, self.jira_token) as ingestor:
+            if "jql" in params:
+                tickets = await ingestor.ingest_issues_by_jql(
+                    params["jql"], self.db, params.get("limit", 100)
+                )
+            elif "keys" in params:
+                tickets = await ingestor.ingest_issues_by_keys(params["keys"], self.db)
+            else:
+                raise ValueError("Must provide either 'jql' or 'keys'")
 
         return {"status": "success", "ticket_count": len(tickets)}
 

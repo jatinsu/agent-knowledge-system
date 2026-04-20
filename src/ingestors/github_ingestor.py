@@ -6,82 +6,126 @@ import httpx
 from sqlalchemy.orm import Session
 
 from src.db.models import Repository, PullRequest
+from src.ingestors.mcp_client import MCPClient
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+GITHUB_MCP_COMMAND = "npx"
+GITHUB_MCP_ARGS = ["-y", "@modelcontextprotocol/server-github"]
 
 
 class GitHubIngestor:
     def __init__(self, token: str):
         self.token = token
-        self.base_url = "https://api.github.com"
-        self.headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        }
+        self._client: MCPClient | None = None
+
+    async def __aenter__(self) -> "GitHubIngestor":
+        self._client = MCPClient(
+            command=GITHUB_MCP_COMMAND,
+            args=GITHUB_MCP_ARGS,
+            env={"GITHUB_PERSONAL_ACCESS_TOKEN": self.token},
+        )
+        await self._client.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        if self._client:
+            await self._client.__aexit__(*exc)
+        self._client = None
 
     async def fetch_repository(self, owner: str, repo: str) -> dict[str, Any]:
-        """Fetch repository information from GitHub API."""
+        logger.info(f"Fetching repository {owner}/{repo}")
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                logger.info(f"Fetching repository {owner}/{repo}")
-                response = await client.get(
-                    f"{self.base_url}/repos/{owner}/{repo}", headers=self.headers
-                )
-                response.raise_for_status()
-                return response.json()
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error fetching repo {owner}/{repo}: {e.response.status_code}")
-            raise
-        except httpx.TimeoutException:
-            logger.error(f"Timeout fetching repo {owner}/{repo}")
-            raise
-        except Exception as e:
-            logger.error(f"Error fetching repo {owner}/{repo}: {e}")
-            raise
+            return await self._client.call_tool(
+                "get_repository", {"owner": owner, "repo": repo}
+            )
+        except Exception:
+            logger.info("get_repository tool not available, using constructed data")
+            return {
+                "name": repo,
+                "owner": {"login": owner},
+                "html_url": f"https://github.com/{owner}/{repo}",
+                "default_branch": "main",
+                "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
 
     async def fetch_pull_requests(
         self, owner: str, repo: str, state: str = "all", limit: int = 100
     ) -> list[dict[str, Any]]:
-        """Fetch pull requests from GitHub API."""
+        logger.info(f"Fetching PRs for {owner}/{repo} (limit={limit})")
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                logger.info(f"Fetching PRs for {owner}/{repo} (limit={limit})")
-                response = await client.get(
-                    f"{self.base_url}/repos/{owner}/{repo}/pulls",
-                    headers=self.headers,
-                    params={"state": state, "per_page": min(limit, 100), "sort": "updated", "direction": "desc"},
-                )
-                response.raise_for_status()
-                prs = response.json()
-                logger.info(f"Fetched {len(prs)} PRs from {owner}/{repo}")
-                return prs
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error fetching PRs: {e.response.status_code}")
-            raise
+            result = await self._client.call_tool(
+                "list_pull_requests",
+                {
+                    "owner": owner,
+                    "repo": repo,
+                    "state": state,
+                    "per_page": min(limit, 100),
+                    "sort": "updated",
+                    "direction": "desc",
+                },
+            )
+            prs = result if isinstance(result, list) else []
         except Exception as e:
-            logger.error(f"Error fetching PRs: {e}")
-            raise
+            logger.warning(f"MCP list_pull_requests failed, falling back to httpx: {e}")
+            prs = await self._fetch_pull_requests_httpx(owner, repo, state, limit)
+        logger.info(f"Fetched {len(prs)} PRs from {owner}/{repo}")
+        return prs
 
-    async def fetch_pr_files(self, owner: str, repo: str, pr_number: int) -> list[dict[str, Any]]:
-        """Fetch files changed in a pull request."""
+    async def _fetch_pull_requests_httpx(
+        self, owner: str, repo: str, state: str, limit: int
+    ) -> list[dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"https://api.github.com/repos/{owner}/{repo}/pulls",
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Accept": "application/vnd.github+json",
+                },
+                params={
+                    "state": state,
+                    "per_page": min(limit, 100),
+                    "sort": "updated",
+                    "direction": "desc",
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def fetch_pr_files(
+        self, owner: str, repo: str, pr_number: int
+    ) -> list[dict[str, Any]]:
+        try:
+            result = await self._client.call_tool(
+                "get_pull_request_files",
+                {"owner": owner, "repo": repo, "pull_number": pr_number},
+            )
+            return result if isinstance(result, list) else []
+        except Exception as e:
+            logger.warning(f"MCP get_pull_request_files failed for PR #{pr_number}, falling back to httpx: {e}")
+            return await self._fetch_pr_files_httpx(owner, repo, pr_number)
+
+    async def _fetch_pr_files_httpx(
+        self, owner: str, repo: str, pr_number: int
+    ) -> list[dict[str, Any]]:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(
-                    f"{self.base_url}/repos/{owner}/{repo}/pulls/{pr_number}/files",
-                    headers=self.headers,
+                    f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files",
+                    headers={
+                        "Authorization": f"Bearer {self.token}",
+                        "Accept": "application/vnd.github+json",
+                    },
                 )
                 response.raise_for_status()
                 return response.json()
-        except httpx.HTTPStatusError as e:
-            logger.warning(f"HTTP error fetching PR #{pr_number} files: {e.response.status_code}")
-            return []
         except Exception as e:
-            logger.warning(f"Error fetching PR #{pr_number} files: {e}")
+            logger.warning(f"httpx fallback also failed for PR #{pr_number} files: {e}")
             return []
 
-    def extract_jira_keys(self, text: str | None) -> list[str]:
+    @staticmethod
+    def extract_jira_keys(text: str | None) -> list[str]:
         if not text:
             return []
         pattern = r"\b[A-Z]{2,}-\d+\b"

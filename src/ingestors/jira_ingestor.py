@@ -1,62 +1,112 @@
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy.orm import Session
 
 from src.db.models import JiraTicket
+from src.ingestors.mcp_client import MCPClient
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+JIRA_MCP_COMMAND = "npx"
+JIRA_MCP_ARGS = ["-y", "@aashari/mcp-server-atlassian-jira"]
 
 
 class JiraIngestor:
     def __init__(self, url: str, email: str, api_token: str):
         self.url = url.rstrip("/")
-        self.auth = (email, api_token)
-        self.headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        self.email = email
+        self.api_token = api_token
+        self._client: MCPClient | None = None
+
+    def _site_name(self) -> str:
+        """Extract Atlassian site name from URL (e.g. 'myteam' from 'https://myteam.atlassian.net')."""
+        hostname = urlparse(self.url).hostname or ""
+        return hostname.split(".")[0]
+
+    async def __aenter__(self) -> "JiraIngestor":
+        self._client = MCPClient(
+            command=JIRA_MCP_COMMAND,
+            args=JIRA_MCP_ARGS,
+            env={
+                "ATLASSIAN_SITE_NAME": self._site_name(),
+                "ATLASSIAN_USER_EMAIL": self.email,
+                "ATLASSIAN_API_TOKEN": self.api_token,
+            },
+        )
+        await self._client.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        if self._client:
+            await self._client.__aexit__(*exc)
+        self._client = None
 
     async def fetch_issue(self, issue_key: str) -> dict[str, Any]:
-        """Fetch a single Jira issue."""
+        logger.info(f"Fetching Jira issue {issue_key}")
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                logger.info(f"Fetching Jira issue {issue_key}")
-                response = await client.get(
-                    f"{self.url}/rest/api/3/issue/{issue_key}",
-                    auth=self.auth,
-                    headers=self.headers,
-                )
-                response.raise_for_status()
-                return response.json()
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error fetching Jira {issue_key}: {e.response.status_code}")
-            raise
+            return await self._client.call_tool(
+                "jira_get",
+                {
+                    "path": f"/rest/api/3/issue/{issue_key}",
+                    "outputFormat": "json",
+                },
+            )
         except Exception as e:
-            logger.error(f"Error fetching Jira {issue_key}: {e}")
-            raise
+            logger.warning(f"MCP jira_get failed, falling back to httpx: {e}")
+            return await self._fetch_issue_httpx(issue_key)
 
-    async def search_issues(self, jql: str, max_results: int = 100) -> list[dict[str, Any]]:
-        """Search Jira issues using JQL."""
+    async def _fetch_issue_httpx(self, issue_key: str) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{self.url}/rest/api/3/issue/{issue_key}",
+                auth=(self.email, self.api_token),
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def search_issues(
+        self, jql: str, max_results: int = 100
+    ) -> list[dict[str, Any]]:
+        logger.info(f"Searching Jira with JQL: {jql}")
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                logger.info(f"Searching Jira with JQL: {jql}")
-                response = await client.post(
-                    f"{self.url}/rest/api/3/search",
-                    auth=self.auth,
-                    headers=self.headers,
-                    json={"jql": jql, "maxResults": max_results, "fields": ["*all"]},
-                )
-                response.raise_for_status()
-                data = response.json()
-                issues = data.get("issues", [])
-                logger.info(f"Found {len(issues)} Jira issues")
-                return issues
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error searching Jira: {e.response.status_code}")
-            raise
+            result = await self._client.call_tool(
+                "jira_get",
+                {
+                    "path": "/rest/api/3/search/jql",
+                    "queryParams": {"jql": jql, "maxResults": str(max_results), "fields": "*all"},
+                    "outputFormat": "json",
+                },
+            )
+            if isinstance(result, dict):
+                issues = result.get("issues", [])
+            elif isinstance(result, list):
+                issues = result
+            else:
+                raise ValueError(f"Unexpected response type: {type(result)}")
         except Exception as e:
-            logger.error(f"Error searching Jira: {e}")
-            raise
+            logger.warning(f"MCP jira_get search failed, falling back to httpx: {e}")
+            issues = await self._search_issues_httpx(jql, max_results)
+        logger.info(f"Found {len(issues)} Jira issues")
+        return issues
+
+    async def _search_issues_httpx(
+        self, jql: str, max_results: int
+    ) -> list[dict[str, Any]]:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{self.url}/rest/api/3/search/jql",
+                auth=(self.email, self.api_token),
+                headers={"Accept": "application/json"},
+                params={"jql": jql, "maxResults": max_results, "fields": "*all"},
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("issues", [])
 
     def normalize_ticket(self, data: dict[str, Any], db: Session) -> JiraTicket:
         fields = data["fields"]
@@ -114,7 +164,6 @@ class JiraIngestor:
     async def ingest_issues_by_keys(
         self, issue_keys: list[str], db: Session
     ) -> list[JiraTicket]:
-        """Ingest multiple Jira issues by their keys."""
         tickets = []
         for key in issue_keys:
             try:
