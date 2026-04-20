@@ -78,16 +78,15 @@ class RouterOrchestrator:
         if not self.jira_ingestor:
             raise ValueError("Jira ingestor not configured")
 
-        if "jql" in params:
-            tickets = await self.jira_ingestor.ingest_issues_by_jql(
-                params["jql"], self.db, params.get("limit", 100)
+        if "keys" in params:
+            issue_type = params.get("issue_type", "epic")
+            records = await self.jira_ingestor.ingest_issues_by_keys(
+                params["keys"], issue_type, self.db
             )
-        elif "keys" in params:
-            tickets = await self.jira_ingestor.ingest_issues_by_keys(params["keys"], self.db)
-        else:
-            raise ValueError("Must provide either 'jql' or 'keys'")
+            return {"status": "success", "ticket_count": len(records)}
 
-        return {"status": "success", "ticket_count": len(tickets)}
+        counts = await self.jira_ingestor.ingest_from_prs(self.db)
+        return {"status": "success", **counts}
 
     async def _build_features(self, params: dict[str, Any]) -> dict[str, Any]:
         repo_id = params["repo_id"]
