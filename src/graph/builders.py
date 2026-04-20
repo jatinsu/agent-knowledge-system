@@ -1,7 +1,7 @@
 from typing import Any
 from sqlalchemy.orm import Session
 
-from src.db.models import Feature, PullRequest, JiraTicket, FeaturePRAssociation, FeatureJiraAssociation
+from src.db.models import Feature, PullRequest, JiraEpic, JiraStory, JiraTask, FeaturePRAssociation
 from src.graph.types import Node, Edge, NodeType, EdgeType, KnowledgeGraph
 
 
@@ -9,19 +9,21 @@ class FeatureBuilder:
     def __init__(self, db: Session):
         self.db = db
 
-    def link_pr_to_jira(self, pr: PullRequest) -> list[JiraTicket]:
-        if not pr.jira_keys:
-            return []
+    def _lookup_jira_record(self, key: str, issue_type: str) -> JiraEpic | JiraStory | JiraTask | None:
+        model_map = {"epic": JiraEpic, "story": JiraStory, "task": JiraTask}
+        model = model_map.get(issue_type)
+        if not model:
+            return None
+        return self.db.get(model, key)
 
-        jira_keys = pr.jira_keys.split(",")
-        tickets = []
-
-        for key in jira_keys:
-            ticket = self.db.query(JiraTicket).filter(JiraTicket.key == key.strip()).first()
-            if ticket:
-                tickets.append(ticket)
-
-        return tickets
+    def get_jira_records_for_pr(self, pr: PullRequest) -> list[dict[str, Any]]:
+        records = []
+        for key, issue_type in [(pr.epic_key, "epic"), (pr.story_key, "story"), (pr.task_key, "task")]:
+            if key:
+                record = self._lookup_jira_record(key, issue_type)
+                if record:
+                    records.append({"key": record.id, "title": record.title, "type": issue_type})
+        return records
 
     def build_feature_from_pr(self, pr: PullRequest) -> Feature:
         existing_feature = (
@@ -45,11 +47,6 @@ class FeatureBuilder:
 
         assoc = FeaturePRAssociation(feature_id=feature.id, pr_id=pr.id)
         self.db.add(assoc)
-
-        jira_tickets = self.link_pr_to_jira(pr)
-        for ticket in jira_tickets:
-            jira_assoc = FeatureJiraAssociation(feature_id=feature.id, jira_id=ticket.id)
-            self.db.add(jira_assoc)
 
         self.db.commit()
         self.db.refresh(feature)
@@ -175,6 +172,11 @@ class GraphBuilder:
         return edge
 
     def build_feature_subgraph(self, feature: Feature, db: Session) -> Node:
+        feature_builder = FeatureBuilder(db)
+        jira_records = []
+        for pr in feature.pull_requests:
+            jira_records.extend(feature_builder.get_jira_records_for_pr(pr))
+
         feature_concept = self.create_concept_node(
             title=feature.name,
             description=feature.description or "Feature implementation",
@@ -182,7 +184,7 @@ class GraphBuilder:
                 "feature_id": feature.id,
                 "components": feature.components,
                 "pr_count": len(feature.pull_requests),
-                "jira_count": len(feature.jira_tickets),
+                "jira_count": len(jira_records),
             },
         )
 
@@ -201,16 +203,14 @@ class GraphBuilder:
             self.graph.add_node(pr_node)
             self.link_nodes(feature_concept.id, pr_node.id, EdgeType.REFERENCES)
 
-        for ticket in feature.jira_tickets:
+        for jira_rec in jira_records:
             ticket_node = Node(
                 id=self._generate_node_id("jira"),
                 type=NodeType.SECTION,
-                title=f"{ticket.key}: {ticket.summary}",
+                title=f"{jira_rec['key']}: {jira_rec['title']}",
                 metadata={
-                    "jira_id": ticket.id,
-                    "key": ticket.key,
-                    "type": ticket.ticket_type,
-                    "status": ticket.status,
+                    "key": jira_rec["key"],
+                    "type": jira_rec["type"],
                 },
             )
             self.graph.add_node(ticket_node)
