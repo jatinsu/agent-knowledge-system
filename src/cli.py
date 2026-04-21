@@ -59,9 +59,8 @@ def ingest_github(owner: str, repo: str, limit: int):
 
 
 @cli.command()
-@click.option("--keys", help="Comma-separated Jira issue keys (requires --type)")
-@click.option("--type", "issue_type", type=click.Choice(["epic", "story", "task"]), help="Issue type for --keys")
-def ingest_jira(keys: str | None, issue_type: str | None):
+@click.option("--keys", help="Comma-separated Jira issue keys")
+def ingest_jira(keys: str | None):
     """Ingest Jira data from keys found in PR table, or by explicit keys."""
 
     async def run():
@@ -78,23 +77,19 @@ def ingest_jira(keys: str | None, issue_type: str | None):
 
             params: dict = {}
             if keys:
-                if not issue_type:
-                    click.echo("Error: --type is required when using --keys")
-                    return
                 params["keys"] = keys.split(",")
-                params["issue_type"] = issue_type
 
             click.echo("Ingesting Jira issues...")
             result = await orchestrator.execute_task(TaskType.INGEST_JIRA, params)
 
-            if "ticket_count" in result:
-                click.echo(f"Ingested {result['ticket_count']} tickets")
+            if "issue_count" in result:
+                click.echo(f"Ingested {result['issue_count']} issues")
             else:
                 click.echo(
-                    f"Ingested: {result.get('epic', 0)} epics, "
-                    f"{result.get('story', 0)} stories, "
-                    f"{result.get('task', 0)} tasks, "
-                    f"{result.get('project', 0)} projects"
+                    f"Ingested: {result.get('issues', 0)} issues, "
+                    f"{result.get('projects', 0)} projects, "
+                    f"{result.get('issue_types', 0)} issue types, "
+                    f"{result.get('links', 0)} links"
                 )
         finally:
             db.close()

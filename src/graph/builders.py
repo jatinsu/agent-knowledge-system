@@ -1,7 +1,7 @@
 from typing import Any
 from sqlalchemy.orm import Session
 
-from src.db.models import Feature, PullRequest, JiraEpic, JiraStory, JiraTask, FeaturePRAssociation
+from src.db.models import Feature, PullRequest, Issue, FeaturePRAssociation
 from src.graph.types import Node, Edge, NodeType, EdgeType, KnowledgeGraph
 
 
@@ -9,20 +9,18 @@ class FeatureBuilder:
     def __init__(self, db: Session):
         self.db = db
 
-    def _lookup_jira_record(self, key: str, issue_type: str) -> JiraEpic | JiraStory | JiraTask | None:
-        model_map = {"epic": JiraEpic, "story": JiraStory, "task": JiraTask}
-        model = model_map.get(issue_type)
-        if not model:
-            return None
-        return self.db.get(model, key)
-
     def get_jira_records_for_pr(self, pr: PullRequest) -> list[dict[str, Any]]:
         records = []
-        for key, issue_type in [(pr.epic_key, "epic"), (pr.story_key, "story"), (pr.task_key, "task")]:
+        for key in [pr.epic_key, pr.story_key, pr.task_key]:
             if key:
-                record = self._lookup_jira_record(key, issue_type)
-                if record:
-                    records.append({"key": record.id, "title": record.title, "type": issue_type})
+                issue = self.db.query(Issue).filter(Issue.key == key).first()
+                if issue:
+                    records.append({
+                        "key": issue.key,
+                        "title": issue.summary,
+                        "type": issue.issue_type.name if issue.issue_type else "Unknown",
+                        "status": issue.status,
+                    })
         return records
 
     def build_feature_from_pr(self, pr: PullRequest) -> Feature:
